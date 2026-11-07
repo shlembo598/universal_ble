@@ -21,6 +21,26 @@ public class UniversalBlePlugin: NSObject, FlutterPlugin {
     let peripheralCallbackChannel = UniversalBlePeripheralCallback(binaryMessenger: messenger)
     let peripheralApi = UniversalBlePeripheralPlugin(callbackChannel: peripheralCallbackChannel)
     UniversalBlePlatformChannelSetup.setUp(binaryMessenger: messenger, api: api)
+    let ownedChannel = FlutterMethodChannel(name: "geoeye/universal_ble_owned", binaryMessenger: messenger)
+    ownedChannel.setMethodCallHandler { call, result in
+      guard call.method == "write" else { result(FlutterMethodNotImplemented); return }
+      guard let args = call.arguments as? [String: Any],
+            let device = args["deviceId"] as? String, let service = args["service"] as? String,
+            let characteristic = args["characteristic"] as? String,
+            let value = args["value"] as? FlutterStandardTypedData,
+            let withoutResponse = args["withoutResponse"] as? Bool else {
+        result(FlutterError(code: "invalidOwnedWrite", message: nil, details: nil)); return
+      }
+      api.writeOwnedValue(deviceId: device, service: service, characteristic: characteristic,
+                          value: value, bleOutputProperty: withoutResponse ? .withoutResponse : .withResponse) { outcome in
+        switch outcome {
+        case .success: result(nil)
+        case .failure(let error):
+          let mapped = (error as? PigeonError) ?? error.toFlutterError()
+          result(FlutterError(code: mapped.code, message: mapped.message, details: mapped.details))
+        }
+      }
+    }
     #if os(iOS)
       // When the host app declares `bluetooth-central`, build the manager during
       // launch so CoreBluetooth can deliver `willRestoreState:` after a background
@@ -94,8 +114,7 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
   private var requestPermissionStateUpdateHandlers: [(Result<Void, Error>) -> Void] = []
   private var activeServiceDiscoveries: [String: UniversalBleAsyncServiceDiscovery] = [:]
   private var characteristicReadFutures = [CharacteristicReadFuture]()
-  private var characteristicWriteFutures = [CharacteristicWriteFuture]()
-  private var characteristicWriteWithoutResponseFutures = [CharacteristicWriteFuture]()
+  private let writeLedger = DarwinWriteLedger()
   private var characteristicNotifyFutures = [CharacteristicNotifyFuture]()
   private var discoverServicesFutures = [DiscoverServicesFuture]()
   private var rssiReadFutures = [RssiReadFuture]()
@@ -246,7 +265,7 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
     if peripheral.state != CBPeripheralState.disconnected {
       manager.cancelPeripheralConnection(peripheral)
     }
-    cleanUpConnection(deviceId: deviceId)
+    cleanUpConnection(deviceId: deviceId, peripheral: peripheral)
   }
 
   func getConnectionState(deviceId: String) throws -> BleConnectionState {
@@ -267,17 +286,10 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
     }
   }
 
-  func cleanUpConnection(deviceId: String) {
+  func cleanUpConnection(deviceId: String, peripheral: CBPeripheral? = nil) {
+    writeLedger.disconnect(deviceId: deviceId, peripheral: peripheral,
+                           error: createFlutterError(code: .deviceDisconnected, message: "Device Disconnected"))
     characteristicReadFutures.removeAll { future in
-      if future.deviceId == deviceId {
-        future.result(
-          Result.failure(createFlutterError(code: .deviceDisconnected, message: "Device Disconnected"))
-        )
-        return true
-      }
-      return false
-    }
-    characteristicWriteFutures.removeAll { future in
       if future.deviceId == deviceId {
         future.result(
           Result.failure(createFlutterError(code: .deviceDisconnected, message: "Device Disconnected"))
@@ -400,6 +412,21 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
     characteristicReadFutures.append(CharacteristicReadFuture(deviceId: deviceId, characteristicId: gattCharacteristic.uuid.uuidStr, serviceId: gattCharacteristic.service?.uuid.uuidStr, result: completion))
   }
 
+  // Owned no-response writes never retain data awaiting a later readiness callback.
+  // The Dart queue checks source age before this call; main-queue admission and
+  // immediate dispatch below have no intervening asynchronous hop.
+  func writeOwnedValue(deviceId: String, service: String, characteristic: String, value: FlutterStandardTypedData, bleOutputProperty: BleOutputProperty, completion: @escaping (Result<Void, Error>) -> Void) {
+    if bleOutputProperty == .withoutResponse {
+      guard let peripheral = deviceId.findPeripheral(manager: manager),
+            peripheral.state == .connected, peripheral.canSendWriteWithoutResponse else {
+        completion(.failure(createFlutterError(code: .operationInProgress, message: "Owned write not ready")))
+        return
+      }
+    }
+    writeValue(deviceId: deviceId, service: service, characteristic: characteristic, value: value,
+               bleOutputProperty: bleOutputProperty, completion: completion)
+  }
+
   func writeValue(deviceId: String, service: String, characteristic: String, value: FlutterStandardTypedData, bleOutputProperty: BleOutputProperty, completion: @escaping (Result<Void, Error>) -> Void) {
     UniversalBleLogger.shared.logDebug("WRITE -> \(deviceId) \(service) \(characteristic) len=\(value.data.count) property=\(bleOutputProperty)")
     guard let peripheral = deviceId.findPeripheral(manager: manager) else {
@@ -424,15 +451,27 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
         return
       }
     }
-    peripheral.writeValue(value.data, for: gattCharacteristic, type: type)
-
-    // Wait for future response
-    let future = CharacteristicWriteFuture(deviceId: deviceId, characteristicId: gattCharacteristic.uuid.uuidStr, serviceId: gattCharacteristic.service?.uuid.uuidStr, result: completion)
-    if type == CBCharacteristicWriteType.withResponse {
-      characteristicWriteFutures.append(future)
-    } else {
-      characteristicWriteWithoutResponseFutures.append(future)
+    guard peripheral.state == .connected else {
+      completion(.failure(createFlutterError(code: .deviceDisconnected, message: "Device Disconnected")))
+      return
     }
+    let maximum = peripheral.maximumWriteValueLength(for: type)
+    guard maximum > 0, value.data.count <= maximum else {
+      completion(.failure(createFlutterError(code: .invalidAttributeLength, message: "Write exceeds mode-specific maximum")))
+      return
+    }
+    let admitted = writeLedger.admit(
+      deviceId: deviceId, peripheral: peripheral, characteristic: gattCharacteristic,
+      mode: type == .withResponse ? .withResponse : .withoutResponse,
+      data: value.data,
+      send: { data in peripheral.writeValue(data, for: gattCharacteristic, type: type) },
+      result: completion
+    )
+    guard admitted else {
+      completion(.failure(createFlutterError(code: .operationInProgress, message: "A write is already pending on this peripheral")))
+      return
+    }
+    writeLedger.pump(peripheral: peripheral, canSendWithoutResponse: peripheral.canSendWriteWithoutResponse)
   }
 
   func requestMtu(deviceId: String, expectedMtu _: Int64, completion: @escaping (Result<Int64, Error>) -> Void) {
@@ -522,6 +561,9 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
 
   func centralManagerDidUpdateState(_ central: CBCentralManager) {
     let state = central.state.toAvailabilityState()
+    if central.state != .poweredOn {
+      writeLedger.unavailable(error: createFlutterError(code: .bluetoothNotEnabled, message: "Bluetooth unavailable"))
+    }
     callbackChannel.onAvailabilityChanged(state: state) { _ in }
     // Complete Pending state handler
     availabilityStateUpdateHandlers.removeAll { handler in
@@ -586,10 +628,10 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
     callbackChannel.onConnectionChanged(deviceId: peripheral.uuid.uuidString, connected: true, error: nil) { _ in }
   }
 
-  private func handlePeripheralDisconnection(deviceId: String, error: Error?) {
+  private func handlePeripheralDisconnection(deviceId: String, peripheral: CBPeripheral, error: Error?) {
     autoConnectDevices.remove(deviceId)
     callbackChannel.onConnectionChanged(deviceId: deviceId, connected: false, error: error?.localizedDescription) { _ in }
-    cleanUpConnection(deviceId: deviceId)
+    cleanUpConnection(deviceId: deviceId, peripheral: peripheral)
   }
 
   public func centralManager(
@@ -603,21 +645,23 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
 
     if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
       if isReconnecting {
+        writeLedger.disconnect(deviceId: deviceId, peripheral: peripheral,
+                               error: createFlutterError(code: .deviceDisconnected, message: "Device reconnecting"))
         return
       }
     }
 
-    handlePeripheralDisconnection(deviceId: deviceId, error: error)
+    handlePeripheralDisconnection(deviceId: deviceId, peripheral: peripheral, error: error)
   }
 
   public func centralManager(_: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
     let deviceId = peripheral.uuid.uuidString
-    handlePeripheralDisconnection(deviceId: deviceId, error: error)
+    handlePeripheralDisconnection(deviceId: deviceId, peripheral: peripheral, error: error)
   }
 
   public func centralManager(_: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
     callbackChannel.onConnectionChanged(deviceId: peripheral.uuid.uuidString, connected: false, error: error?.localizedDescription) { _ in }
-    cleanUpConnection(deviceId: peripheral.uuid.uuidString)
+    cleanUpConnection(deviceId: peripheral.uuid.uuidString, peripheral: peripheral)
   }
 
   public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -633,28 +677,22 @@ private class BleCentralDarwin: NSObject, UniversalBlePlatformChannel, CBCentral
   }
 
   public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-    characteristicWriteWithoutResponseFutures.removeAll { future in
-      if future.deviceId == peripheral.uuid.uuidString {
-        future.result(Result.success({}()))
-        return true
-      }
-      return false
+    guard peripheral.state == .connected else {
+      writeLedger.disconnect(deviceId: peripheral.uuid.uuidString, peripheral: peripheral,
+                             error: createFlutterError(code: .deviceDisconnected, message: "Device Disconnected"))
+      return
     }
+    writeLedger.pump(peripheral: peripheral, canSendWithoutResponse: peripheral.canSendWriteWithoutResponse)
   }
 
   public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-    characteristicWriteFutures.removeAll { future in
-      if future.deviceId == peripheral.uuid.uuidString && future.characteristicId == characteristic.uuid.uuidStr && future.serviceId == characteristic.service?.uuid.uuidStr {
-        if let flutterError = error?.toFlutterError() {
-          UniversalBleLogger.shared.logError("WRITE_FAILED <- \(peripheral.uuid.uuidString) \(characteristic.uuid.uuidStr): \(flutterError.message ?? "")")
-          future.result(Result.failure(flutterError))
-        } else {
-          future.result(Result.success({}()))
-        }
-        return true
-      }
-      return false
+    let result: Result<Void, Error>
+    if let error = error {
+      result = .failure(error.toFlutterError())
+    } else {
+      result = .success(())
     }
+    writeLedger.acknowledge(peripheral: peripheral, characteristic: characteristic, result: result)
   }
 
   public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {

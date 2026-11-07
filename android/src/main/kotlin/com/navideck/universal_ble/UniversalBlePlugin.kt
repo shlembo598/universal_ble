@@ -57,7 +57,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
     private val discoverServicesFutureList = mutableListOf<DiscoverServicesFuture>()
     private val mtuResultFutureList = mutableListOf<MtuResultFuture>()
     private val readResultFutureList = mutableListOf<ReadResultFuture>()
-    private val writeResultFutureList = mutableListOf<WriteResultFuture>()
+    private val writeLedger = GattWriteLedger()
     private val subscriptionResultFutureList = mutableListOf<SubscriptionResultFuture>()
     private val pairResultFutures = mutableMapOf<String, (Result<Boolean>) -> Unit>()
     private val rssiResultFutureList = mutableListOf<RssiResultFuture>()
@@ -666,6 +666,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         bleOutputProperty: BleOutputProperty,
         callback: (Result<Unit>) -> Unit,
     ) {
+        var ownedWrite: GattWriteLedger.Write? = null
         try {
             UniversalBleLogger.logDebug("WRITE -> $deviceId $service $characteristic len=${value.size} property=$bleOutputProperty")
             val gatt = deviceId.toBluetoothGatt()
@@ -712,15 +713,15 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
             }
 
 
-            val writeFuture = WriteResultFuture(
-                gatt.device.address,
-                gattCharacteristic.uuid.toString(),
-                gattCharacteristic.service.uuid.toString(),
-                callback
-            )
-
-            // Wait for the result
-            writeResultFutureList.add(writeFuture)
+            val write = writeLedger.admit(deviceId, gatt, gattCharacteristic, callback)
+            if (write == null) {
+                callback(Result.failure(createFlutterError(
+                    UniversalBleErrorCode.OPERATION_IN_PROGRESS,
+                    "A write is already pending on this GATT"
+                )))
+                return
+            }
+            ownedWrite = write
 
             val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeCharacteristic(gattCharacteristic, value, writeType)
@@ -734,19 +735,16 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
             }
 
             if (result != BluetoothGatt.GATT_SUCCESS) {
-                writeResultFutureList.remove(writeFuture)
-                callback(
-                    Result.failure(
-                        createFlutterError(
-                            gattStatusToUniversalBleErrorCode(result),
-                            "Failed to write",
-                            result.toString()
-                        )
-                    )
-                )
+                writeLedger.reject(write, createFlutterError(
+                    gattStatusToUniversalBleErrorCode(result), "Failed to write", result.toString()
+                ))
             }
-        } catch (e: FlutterError) {
-            callback(Result.failure(e))
+        } catch (error: Exception) {
+            val failure = if (error is FlutterError) error else createFlutterError(
+                UniversalBleErrorCode.WRITE_FAILED, "Failed to write", error.javaClass.simpleName
+            )
+            val write = ownedWrite
+            if (write == null) callback(Result.failure(failure)) else writeLedger.reject(write, failure)
         }
     }
 
@@ -755,32 +753,10 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         characteristic: BluetoothGattCharacteristic,
         status: Int,
     ) {
-        writeResultFutureList.removeAll {
-            if (it.deviceId == gatt?.device?.address &&
-                it.characteristicId == characteristic.uuid.toString() &&
-                it.serviceId == characteristic.service.uuid.toString()
-            ) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    it.result(Result.success(Unit))
-                } else {
-                    UniversalBleLogger.logError(
-                        "WRITE_FAILED <- ${gatt?.device?.address} ${characteristic.uuid} status=$status"
-                    )
-                    it.result(
-                        Result.failure(
-                            createFlutterError(
-                                gattStatusToUniversalBleErrorCode(status),
-                                "Failed to write",
-                                status.toString()
-                            )
-                        )
-                    )
-                }
-                true
-            } else {
-                false
-            }
-        }
+        val result = if (status == BluetoothGatt.GATT_SUCCESS) Result.success(Unit) else Result.failure(
+            createFlutterError(gattStatusToUniversalBleErrorCode(status), "Failed to write", status.toString())
+        )
+        writeLedger.complete(gatt, characteristic, result)
     }
 
 
@@ -1086,7 +1062,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         }
     }
 
-    private fun cleanUpConnection(deviceId: String) {
+    private fun cleanUpConnection(deviceId: String, gatt: BluetoothGatt? = null) {
         val deviceDisconnectedError: FlutterError = createFlutterError(
             UniversalBleErrorCode.DEVICE_DISCONNECTED,
             "Device Disconnected",
@@ -1099,14 +1075,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
                 false
             }
         }
-        writeResultFutureList.removeAll {
-            if (it.deviceId == deviceId) {
-                it.result(Result.failure(deviceDisconnectedError))
-                true
-            } else {
-                false
-            }
-        }
+        writeLedger.disconnect(deviceId, gatt, deviceDisconnectedError)
         subscriptionResultFutureList.removeAll {
             if (it.deviceId == deviceId) {
                 it.result(Result.failure(deviceDisconnectedError))
@@ -1144,7 +1113,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
     private fun cleanConnection(gatt: BluetoothGatt) {
         gatt.removeCache()
         gatt.disconnect()
-        cleanUpConnection(gatt.device.address)
+        cleanUpConnection(gatt.device.address, gatt)
     }
 
     private fun onBondStateUpdate(deviceId: String, bonded: Boolean, error: String? = null) {
@@ -1251,6 +1220,18 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         status: Int,
         newState: Int,
     ) {
+        mainThreadHandler?.post { handleConnectionStateChange(gatt, status, newState) }
+    }
+
+    private fun handleConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        val current = gatt.device.address.findGatt()
+        if (current !== gatt && (current != null || newState != BluetoothGatt.STATE_DISCONNECTED)) {
+            writeLedger.disconnect(gatt.device.address, gatt, createFlutterError(
+                UniversalBleErrorCode.DEVICE_DISCONNECTED, "Superseded GATT"
+            ))
+            gatt.close()
+            return
+        }
         UniversalBleLogger.logDebug(
             "onConnectionStateChange-> Status: $status ${status.parseHciErrorCode()}, NewState: $newState"
         )
@@ -1266,7 +1247,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
             val shouldAutoConnect = autoConnectDevices.contains(deviceId)
 
             // Always clean up internal state (futures, etc.)
-            cleanUpConnection(deviceId)
+            cleanUpConnection(deviceId, gatt)
 
             // Send connection changed callback
             mainThreadHandler?.post {

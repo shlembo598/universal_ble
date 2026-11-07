@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:universal_ble/src/utils/ble_command_queue.dart';
 import 'package:universal_ble/src/universal_ble_linux/universal_ble_linux_instance.dart';
 import 'package:universal_ble/src/universal_ble_pigeon/universal_ble_pigeon_channel.dart';
@@ -179,6 +180,8 @@ class UniversalBle {
     String deviceId, {
     Duration? timeout,
     String? queueId,
+    // Physical close must remain reachable when a data write never calls back.
+    bool bypassWriteQueue = false,
   }) async {
     timeout ??= const Duration(seconds: 60);
     BleConnectionState? connectionState;
@@ -194,17 +197,18 @@ class UniversalBle {
         timeout: timeout,
       );
 
-      await _bleCommandQueue
-          .queueCommand(
-            () => _platform.disconnect(deviceId),
-            timeout: timeout,
-            deviceId: deviceId,
-            queueId: queueId,
-          )
-          .catchError((error) {
-            if (completer.isCompleted) return;
-            completer.completeError(ConnectionException(error));
-          });
+      final close = bypassWriteQueue
+          ? _platform.disconnect(deviceId)
+          : _bleCommandQueue.queueCommand(
+              () => _platform.disconnect(deviceId),
+              timeout: timeout,
+              deviceId: deviceId,
+              queueId: queueId,
+            );
+      await close.catchError((error) {
+        if (completer.isCompleted) return;
+        completer.completeError(ConnectionException(error));
+      });
 
       if (connectionState == BleConnectionState.disconnected ||
           connectionState == BleConnectionState.disconnecting) {
@@ -345,6 +349,50 @@ class UniversalBle {
             : BleOutputProperty.withResponse,
       ),
       timeout: timeout,
+      deviceId: deviceId,
+      queueId: queueId,
+    );
+  }
+
+  /// Opt-in owned write. Checks admission inside the existing queue and waits
+  /// for the original platform Future without a queue timeout.
+  /// A false result means no platform invocation occurred.
+  /// Completion does not prove receiver processing or native cancellation.
+  static Future<bool> writeOwned(
+    String deviceId,
+    String service,
+    String characteristic,
+    Uint8List value, {
+    required bool Function() canDispatch,
+    bool withoutResponse = false,
+    String? queueId,
+  }) {
+    return _bleCommandQueue.queueCommandWithoutTimeout(
+      () async {
+        if (!canDispatch()) return false;
+        if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+          await const MethodChannel(
+            'geoeye/universal_ble_owned',
+          ).invokeMethod<void>('write', {
+            'deviceId': deviceId,
+            'service': BleUuidParser.string(service),
+            'characteristic': BleUuidParser.string(characteristic),
+            'value': value,
+            'withoutResponse': withoutResponse,
+          });
+          return true;
+        }
+        await _platform.writeValue(
+          deviceId,
+          BleUuidParser.string(service),
+          BleUuidParser.string(characteristic),
+          value,
+          withoutResponse
+              ? BleOutputProperty.withoutResponse
+              : BleOutputProperty.withResponse,
+        );
+        return true;
+      },
       deviceId: deviceId,
       queueId: queueId,
     );

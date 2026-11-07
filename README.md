@@ -1,3 +1,7 @@
+> GEOEYE fork: upstream 2.1.0 plus owned-write/physical-close fixes.
+> [Patch contract and validation](GEOEYE_PATCHES.md). Pin a reviewed commit;
+> the fork main branch tracks newer upstream code and is not this 2.1.x line.
+
 # Universal BLE
 
 <div align="center">

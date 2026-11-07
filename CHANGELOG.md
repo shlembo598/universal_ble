@@ -1,3 +1,11 @@
+## GEOEYE fork (unreleased, upstream 2.1.0)
+
+- Add queue-owned writes with dispatch guards and original native Future ownership.
+- Add explicit physical disconnect bypass without changing legacy queue/timeouts.
+- Fix Android write ownership by GATT/characteristic identity and cleanup once.
+- Add Darwin write ownership and immediate owned no-response admission checks.
+- Keep generated Pigeon contracts, upstream APIs and licenses unchanged.
+
 ## 2.1.0
 * Add optional `queueId` parameter to all APIs
 * Android: add `legacy` to `AndroidOptions` — set `legacy: true` to scan legacy BLE 4.x advertisements (e.g. ESP32) on API 26+; default (`null`/`false`) keeps extended-advertisement scanning unchanged from prior releases

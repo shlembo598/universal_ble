@@ -112,7 +112,7 @@ fun BluetoothGatt.saveCacheIfNeeded() {
 }
 
 fun BluetoothGatt.removeCache() {
-    knownGatts.remove(this.device.address)
+    knownGatts.remove(this.device.address, this)
 }
 
 
